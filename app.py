@@ -90,7 +90,10 @@ def login_user(username, password):
         # Verify the password
         if check_password_hash(stored_password_hash, password):
             st.success("Login successful.")
-            # Use aes_key for encryption/decryption
+            # Store login state and AES key in session state
+            st.session_state.logged_in = True
+            st.session_state.username = username
+            st.session_state.aes_key = aes_key
             return aes_key
         else:
             st.error("Incorrect password.")
@@ -162,50 +165,81 @@ def file_sharing_interface(username, aes_key):
 
     with tabs[0]:  # Send File tab
         st.write("### Send File")
-        recipient = st.text_input("Recipient Username")
-        file_to_send = st.file_uploader("Choose a file to send", type=["txt", "pdf", "jpg", "png", "docx"])
+        recipient = st.text_input("Recipient Username", key="recipient_username")
+        file_to_send = st.file_uploader("Choose a file to send", type=["txt", "pdf", "jpg", "png", "docx"], key="file_uploader")
+
         if file_to_send and recipient:
-            if st.button("Send"):
-                send_file(username, recipient, file_to_send.name, file_to_send.read())
+            file_data = file_to_send.read()
+            file_name = file_to_send.name
+
+            if st.button("Send File", key="send_file_button"):
+                send_file(username, recipient, file_name, file_data)
 
     with tabs[1]:  # Received Files tab
         st.write("### Received Files")
+
+        # Retrieve files that were sent to the logged-in user
         files = list_received_files(username)
-        for file_id, sender, file_name in files:
-            st.write(f"File from {sender}: {file_name}")
-            if st.button(f"Download {file_name}", key=file_id):
-                # Get the encrypted file data and decrypt it
-                file_name, encrypted_data = get_file_data(file_id)
-                decrypted_data = decrypt_file(encrypted_data, aes_key)
-                # Provide the file as a download
-                st.download_button(label="Download", data=decrypted_data, file_name=file_name)
+        if files:
+            for file_id, sender, file_name in files:
+                st.write(f"File from {sender}: {file_name}")
+                
+                # Button to download the file
+                if st.button(f"Download {file_name}", key=f"download_button_{file_id}"):
+                    # Fetch the encrypted file from the database
+                    file_name, encrypted_data = get_file_data(file_id)
+
+                    # Decrypt the file using the receiver's AES key
+                    decrypted_data = decrypt_file(encrypted_data, aes_key)
+
+                    # Provide the file as a downloadable button
+                    st.download_button(label=f"Download {file_name}",
+                                    data=decrypted_data,
+                                    file_name=file_name,
+                                    mime="application/octet-stream")
+        else:
+            st.write("No files received yet.")
 
 def main():
     st.title("Secure File Sharing App")
+    
+    # Initialize session state for login
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+    if 'username' not in st.session_state:
+        st.session_state.username = None
+    if 'aes_key' not in st.session_state:
+        st.session_state.aes_key = None
+
     menu = ["Register", "Login"]
     choice = st.sidebar.selectbox("Menu", menu)
 
     if choice == "Register":
         st.subheader("Create a New Account")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Register"):
+        username = st.text_input("Username", key="register_username")
+        password = st.text_input("Password", type="password", key="register_password")
+        if st.button("Register", key="register_button"):
             if username and password:
                 register_user(username, password)
             else:
                 st.warning("Please enter both username and password")
 
-    elif choice == "Login":
+    elif choice == "Login" and not st.session_state.logged_in:
         st.subheader("Login to Your Account")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Login"):
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login", key="login_button"):
             if username and password:
                 aes_key = login_user(username, password)
                 if aes_key:
-                    file_sharing_interface(username, aes_key)
+                    st.session_state.logged_in = True
+                    #st.experimental_rerun()
             else:
                 st.warning("Please enter both username and password")
+
+    # If logged in, display the file sharing interface only once
+    if st.session_state.logged_in:
+        file_sharing_interface(st.session_state.username, st.session_state.aes_key)
 
 if __name__ == '__main__':
     main()
