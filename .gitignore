@@ -1,3 +1,8 @@
-__pycache__
+# Ignore Python bytecode files
+__pycache__/
+
+# Ignore the virtual environment folder
 venv/
+
+# Ignore the SQLite database file
 file_sharing_app.db
