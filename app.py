@@ -2,8 +2,11 @@ import streamlit as st
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
 import sqlite3
-from Crypto.Cipher import AES
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, AES
 from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
+from Crypto.Protocol.KDF import PBKDF2
 
 # Database setup
 def init_db():
@@ -16,7 +19,8 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL UNIQUE,
         password_hash TEXT NOT NULL,
-        aes_key BLOB NOT NULL
+        private_key BLOB NOT NULL,
+        public_key BLOB NOT NULL
     )
     ''')
 
@@ -38,132 +42,195 @@ def init_db():
 # Initialize the database
 init_db()
 
-def get_user_aes_key(username):
-    # Retrieve the AES key for the given username
-    conn = sqlite3.connect('file_sharing_app.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT aes_key FROM users WHERE username = ?', (username,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
+def generate_rsa_keypair():
+    key = RSA.generate(2048)
+    private_key = key.export_key()
+    public_key = key.publickey().export_key()
+    return private_key, public_key
 
+# Encrypt the private key using the password-derived AES key
+def encrypt_private_key(private_key, password):
+    salt = get_random_bytes(16)  # Generate a salt for key derivation
+    aes_key = PBKDF2(password, salt, dkLen=32, count=1000000)  # Derive AES-256 key from the password
+
+    cipher = AES.new(aes_key, AES.MODE_CBC)  # AES cipher in CBC mode
+    iv = cipher.iv  # Initialization vector
+    encrypted_private_key = cipher.encrypt(pad(private_key, AES.block_size))  # Encrypt the private key
+
+    return salt, iv, encrypted_private_key
+
+# Decrypt the private key using the password-derived AES key
+def decrypt_private_key(encrypted_private_key_data, password):
+    salt = encrypted_private_key_data[:16]  # First 16 bytes are the salt
+    iv = encrypted_private_key_data[16:32]  # Next 16 bytes are the IV
+    encrypted_private_key = encrypted_private_key_data[32:]  # The rest is the encrypted private key
+
+    # Derive the AES key from the password using the salt
+    aes_key = PBKDF2(password, salt, dkLen=32, count=1000000)
+
+    # Decrypt the private key
+    cipher = AES.new(aes_key, AES.MODE_CBC, iv)
+    private_key = unpad(cipher.decrypt(encrypted_private_key), AES.block_size)
+
+    return private_key
+
+# User registration
 def register_user(username, password):
-    # Connect to the database
     conn = sqlite3.connect('file_sharing_app.db')
     cursor = conn.cursor()
 
-    # Hash the password with the correct method
+    # Hash the password for future login verification
     password_hash = generate_password_hash(password, method='pbkdf2:sha256')
 
-    # Generate a random AES key (32 bytes for AES-256)
-    aes_key = os.urandom(32)
+    # Generate RSA keys
+    private_key, public_key = generate_rsa_keypair()
+
+    # Encrypt the private key using the user's password
+    salt, iv, encrypted_private_key = encrypt_private_key(private_key, password)
 
     try:
-        # Insert user data into the table
+        # Store the encrypted private key (salt + iv + encrypted_private_key) and the public key
         cursor.execute('''
-        INSERT INTO users (username, password_hash, aes_key)
-        VALUES (?, ?, ?)
-        ''', (username, password_hash, aes_key))
+        INSERT INTO users (username, password_hash, private_key, public_key)
+        VALUES (?, ?, ?, ?)
+        ''', (username, password_hash, salt + iv + encrypted_private_key, public_key))
 
-        # Commit the changes
+        # Commit changes
         conn.commit()
         st.success(f"User {username} registered successfully.")
     except sqlite3.IntegrityError:
         st.error("Username already exists.")
     finally:
-        # Close the connection
         conn.close()
 
+# Retrieve user's public and private keys
+def get_user_keys(username):
+    conn = sqlite3.connect('file_sharing_app.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT private_key, public_key FROM users WHERE username = ?', (username,))
+    result = cursor.fetchone()
+    conn.close()
+    return result  # Returns (private_key, public_key)
+
+# User login
 def login_user(username, password):
-    # Connect to the database
     conn = sqlite3.connect('file_sharing_app.db')
     cursor = conn.cursor()
 
-    # Retrieve user data based on the username
+    # Retrieve the password hash and encrypted private key from the database
     cursor.execute('''
-    SELECT password_hash, aes_key FROM users WHERE username = ?
+    SELECT password_hash, private_key FROM users WHERE username = ?
     ''', (username,))
     result = cursor.fetchone()
 
     if result:
-        stored_password_hash, aes_key = result
-        # Verify the password
+        stored_password_hash, encrypted_private_key_data = result
         if check_password_hash(stored_password_hash, password):
             st.success("Login successful.")
-            # Store login state and AES key in session state
             st.session_state.logged_in = True
             st.session_state.username = username
-            st.session_state.aes_key = aes_key
-            return aes_key
+
+            # Decrypt the private key using the user's password
+            private_key = decrypt_private_key(encrypted_private_key_data, password)
+            st.session_state.private_key = private_key
+
+            # Fetch the public key from the database
+            _, public_key = get_user_keys(username)
+            st.session_state.public_key = public_key
+
+            return public_key
         else:
             st.error("Incorrect password.")
     else:
         st.error("User not found.")
 
-    # Close the connection
     conn.close()
     return None
 
-def encrypt_file(file_data, aes_key):
-    # Encrypt the file data using AES
-    cipher = AES.new(aes_key, AES.MODE_EAX)
-    ciphertext, tag = cipher.encrypt_and_digest(file_data)
-    return cipher.nonce + tag + ciphertext  # Concatenate nonce, tag, and ciphertext
+# AES Encryption
+def encrypt_file_with_aes(file_data):
+    aes_key = get_random_bytes(32)  # AES-256 key
+    aes_iv = get_random_bytes(16)   # AES initialization vector
+    cipher = AES.new(aes_key, AES.MODE_CBC, aes_iv)
+    encrypted_data = cipher.encrypt(pad(file_data, AES.block_size))
+    return aes_key, aes_iv, encrypted_data
 
-def decrypt_file(encrypted_data, aes_key):
-    # Decrypt the file data using AES
-    nonce = encrypted_data[:16]
-    tag = encrypted_data[16:32]
-    ciphertext = encrypted_data[32:]
-    cipher = AES.new(aes_key, AES.MODE_EAX, nonce=nonce)
-    return cipher.decrypt_and_verify(ciphertext, tag)
+def decrypt_file_with_aes(encrypted_data, aes_key, aes_iv):
+    cipher = AES.new(aes_key, AES.MODE_CBC, aes_iv)
+    decrypted_data = unpad(cipher.decrypt(encrypted_data), AES.block_size)
+    return decrypted_data
 
+# RSA Encryption
+def encrypt_file_with_rsa(data, public_key):
+    rsa_key = RSA.import_key(public_key)
+    cipher = PKCS1_OAEP.new(rsa_key)
+    encrypted_data = cipher.encrypt(data)
+    return encrypted_data
+
+def decrypt_file_with_rsa(encrypted_data, private_key):
+    rsa_key = RSA.import_key(private_key)
+    cipher = PKCS1_OAEP.new(rsa_key)
+    return cipher.decrypt(encrypted_data)
+
+# Sending a file
 def send_file(sender, receiver, file_name, file_data):
-    # Get the AES key of the receiver
-    receiver_aes_key = get_user_aes_key(receiver)
-    if not receiver_aes_key:
-        st.error("Recipient not found.")
+    keys = get_user_keys(receiver)
+    
+    if keys is None:
+        st.error(f"Recipient '{receiver}' not found.")
         return
 
-    # Encrypt the file with the receiver's AES key
-    encrypted_file_data = encrypt_file(file_data, receiver_aes_key)
+    _, receiver_public_key = keys
 
-    # Save the file to the database
+    aes_key, aes_iv, encrypted_file_data = encrypt_file_with_aes(file_data)
+    encrypted_aes_key = encrypt_file_with_rsa(aes_key + aes_iv, receiver_public_key)
+
     conn = sqlite3.connect('file_sharing_app.db')
     cursor = conn.cursor()
     cursor.execute('''
     INSERT INTO files (sender, receiver, filename, file_data)
     VALUES (?, ?, ?, ?)
-    ''', (sender, receiver, file_name, encrypted_file_data))
+    ''', (sender, receiver, file_name, encrypted_aes_key + encrypted_file_data))
     conn.commit()
     conn.close()
     st.success(f"File '{file_name}' sent to {receiver} successfully.")
 
+# Listing received files
 def list_received_files(username):
-    # Retrieve files sent to the logged-in user
     conn = sqlite3.connect('file_sharing_app.db')
     cursor = conn.cursor()
     cursor.execute('''
-    SELECT id, sender, filename FROM files WHERE receiver = ?
+    SELECT id, sender, filename, file_data FROM files WHERE receiver = ?
     ''', (username,))
     files = cursor.fetchall()
     conn.close()
-    return files
 
-def get_file_data(file_id):
-    # Retrieve file data based on file ID
-    conn = sqlite3.connect('file_sharing_app.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT filename, file_data FROM files WHERE id = ?', (file_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result
+    if files:
+        for file_id, sender, file_name, encrypted_data in files:
+            st.write(f"File from {sender}: {file_name}")
 
-def file_sharing_interface(username, aes_key):
+            encrypted_aes_key = encrypted_data[:256]  # RSA-encrypted AES key
+            encrypted_file_data = encrypted_data[256:]
+
+            aes_key_iv = decrypt_file_with_rsa(encrypted_aes_key, st.session_state.private_key)
+            aes_key, aes_iv = aes_key_iv[:32], aes_key_iv[32:]
+
+            decrypted_data = decrypt_file_with_aes(encrypted_file_data, aes_key, aes_iv)
+
+            st.download_button(label=f"Download {file_name}",
+                            data=decrypted_data,
+                            file_name=file_name,
+                            mime="application/octet-stream",
+                            key=f"download_button_{file_id}")
+    else:
+        st.write("No files received yet.")
+
+# File sharing interface
+def file_sharing_interface(username):
     st.subheader("File Sharing Interface")
     tabs = st.tabs(["Send File", "Received Files"])
 
-    with tabs[0]:  # Send File tab
+    with tabs[0]:
         st.write("### Send File")
         recipient = st.text_input("Recipient Username", key="recipient_username")
         file_to_send = st.file_uploader("Choose a file to send", type=["txt", "pdf", "jpg", "png", "docx"], key="file_uploader")
@@ -171,75 +238,45 @@ def file_sharing_interface(username, aes_key):
         if file_to_send and recipient:
             file_data = file_to_send.read()
             file_name = file_to_send.name
-
             if st.button("Send File", key="send_file_button"):
                 send_file(username, recipient, file_name, file_data)
 
-    with tabs[1]:  # Received Files tab
+    with tabs[1]:
         st.write("### Received Files")
+        list_received_files(username)
 
-        # Retrieve files that were sent to the logged-in user
-        files = list_received_files(username)
-        if files:
-            for file_id, sender, file_name in files:
-                st.write(f"File from {sender}: {file_name}")
-                
-                # Button to download the file
-                if st.button(f"Download {file_name}", key=f"download_button_{file_id}"):
-                    # Fetch the encrypted file from the database
-                    file_name, encrypted_data = get_file_data(file_id)
-
-                    # Decrypt the file using the receiver's AES key
-                    decrypted_data = decrypt_file(encrypted_data, aes_key)
-
-                    # Provide the file as a downloadable button
-                    st.download_button(label=f"Download {file_name}",
-                                    data=decrypted_data,
-                                    file_name=file_name,
-                                    mime="application/octet-stream")
-        else:
-            st.write("No files received yet.")
-
+# Main function
 def main():
     st.title("Secure File Sharing App")
-    
-    # Initialize session state for login
-    if 'logged_in' not in st.session_state:
+
+    # Session state to track login status
+    if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
-    if 'username' not in st.session_state:
-        st.session_state.username = None
-    if 'aes_key' not in st.session_state:
-        st.session_state.aes_key = None
 
-    menu = ["Register", "Login"]
-    choice = st.sidebar.selectbox("Menu", menu)
+    # Login and registration interface
+    if not st.session_state.logged_in:
+        st.subheader("Login or Register")
 
-    if choice == "Register":
-        st.subheader("Create a New Account")
-        username = st.text_input("Username", key="register_username")
-        password = st.text_input("Password", type="password", key="register_password")
-        if st.button("Register", key="register_button"):
-            if username and password:
-                register_user(username, password)
-            else:
-                st.warning("Please enter both username and password")
+        tabs = st.tabs(["Login", "Register"])
 
-    elif choice == "Login" and not st.session_state.logged_in:
-        st.subheader("Login to Your Account")
-        username = st.text_input("Username", key="login_username")
-        password = st.text_input("Password", type="password", key="login_password")
-        if st.button("Login", key="login_button"):
-            if username and password:
-                aes_key = login_user(username, password)
-                if aes_key:
-                    st.session_state.logged_in = True
-                    #st.experimental_rerun()
-            else:
-                st.warning("Please enter both username and password")
+        with tabs[0]:
+            st.write("### Login")
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            if st.button("Login", key="login_button"):
+                login_user(username, password)
 
-    # If logged in, display the file sharing interface only once
+        with tabs[1]:
+            st.write("### Register")
+            new_username = st.text_input("New Username", key="register_username")
+            new_password = st.text_input("New Password", type="password", key="register_password")
+            if st.button("Register", key="register_button"):
+                register_user(new_username, new_password)
+
+    # If logged in, show file sharing interface
     if st.session_state.logged_in:
-        file_sharing_interface(st.session_state.username, st.session_state.aes_key)
+        st.success(f"Welcome, {st.session_state.username}!")
+        file_sharing_interface(st.session_state.username)
 
 if __name__ == '__main__':
     main()
