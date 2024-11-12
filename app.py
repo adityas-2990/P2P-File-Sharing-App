@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_cookies_manager import EncryptedCookieManager
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
 import sqlite3
@@ -7,6 +8,16 @@ from Crypto.Cipher import PKCS1_OAEP, AES
 from Crypto.Random import get_random_bytes
 from Crypto.Util.Padding import pad, unpad
 from Crypto.Protocol.KDF import PBKDF2
+
+
+# Initialize cookie manager
+cookies = EncryptedCookieManager(
+    prefix="file_sharing_app_",  # Prefix to distinguish cookies
+    password="your_secret_password"  # Use a secure password here
+)
+
+if not cookies.ready():
+    st.stop()  # Stop execution until cookies are ready
 
 # Database setup
 def init_db():
@@ -112,12 +123,26 @@ def get_user_keys(username):
     conn.close()
     return result  # Returns (private_key, public_key)
 
+def initialize_session():
+    # Check if already logged in via session state
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.session_state.private_key = None
+        st.session_state.public_key = None
+
+    # Check if there's a saved login cookie and restore the session state
+    if cookies.get("logged_in"):
+        st.session_state.logged_in = cookies.get("logged_in") == "True"
+        st.session_state.username = cookies.get("username")
+        st.session_state.private_key = cookies.get("private_key")
+        st.session_state.public_key = cookies.get("public_key")
+        
 # User login
 def login_user(username, password):
     conn = sqlite3.connect('file_sharing_app.db')
     cursor = conn.cursor()
 
-    # Retrieve the password hash and encrypted private key from the database
     cursor.execute('''
     SELECT password_hash, private_key FROM users WHERE username = ?
     ''', (username,))
@@ -126,9 +151,9 @@ def login_user(username, password):
     if result:
         stored_password_hash, encrypted_private_key_data = result
         if check_password_hash(stored_password_hash, password):
-            st.success("Login successful.")
             st.session_state.logged_in = True
             st.session_state.username = username
+            st.success("Login successful.")
 
             # Decrypt the private key using the user's password
             private_key = decrypt_private_key(encrypted_private_key_data, password)
@@ -138,14 +163,33 @@ def login_user(username, password):
             _, public_key = get_user_keys(username)
             st.session_state.public_key = public_key
 
-            return public_key
+            # Store the login state in cookies for persistence
+            cookies["logged_in"] = "True"
+            cookies["username"] = username
+            cookies["private_key"] = private_key.decode('utf-8')  # Convert to string for cookies
+            cookies["public_key"] = public_key.decode('utf-8')  # Convert to string for cookies
+            cookies.save()  # Save all cookies
         else:
             st.error("Incorrect password.")
     else:
         st.error("User not found.")
 
     conn.close()
-    return None
+
+def logout():
+    st.session_state.logged_in = False
+    st.session_state.username = ""
+    st.session_state.private_key = None
+    st.session_state.public_key = None
+
+    # Clear cookies
+    cookies["logged_in"] = "False"
+    cookies["username"] = ""
+    cookies["private_key"] = ""
+    cookies["public_key"] = ""
+    cookies.save()
+
+    st.success("Logged out successfully.")
 
 # AES Encryption
 def encrypt_file_with_aes(file_data):
@@ -195,6 +239,38 @@ def send_file(sender, receiver, file_name, file_data):
     conn.close()
     st.success(f"File '{file_name}' sent to {receiver} successfully.")
 
+# Revoke a sent file
+def revoke_file(file_id):
+    conn = sqlite3.connect('file_sharing_app.db')
+    cursor = conn.cursor()
+    
+    # Delete the file from the database by its ID
+    cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
+    conn.commit()
+    conn.close()
+    st.success("File revoked successfully.")
+
+# List files sent by the user
+def list_sent_files(sender):
+    conn = sqlite3.connect('file_sharing_app.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT id, receiver, filename FROM files WHERE sender = ?
+    ''', (sender,))
+    sent_files = cursor.fetchall()
+    conn.close()
+
+    if sent_files:
+        for file_id, receiver, file_name in sent_files:
+            st.write(f"File sent to {receiver}: {file_name}")
+            
+            # Add the Revoke button for each sent file
+            if st.button(f"Revoke {file_name}", key=f"revoke_button_sent_{file_id}"):
+                revoke_file(file_id)
+
+    else:
+        st.write("No files sent yet.")
+
 # Listing received files
 def list_received_files(username):
     conn = sqlite3.connect('file_sharing_app.db')
@@ -217,18 +293,23 @@ def list_received_files(username):
 
             decrypted_data = decrypt_file_with_aes(encrypted_file_data, aes_key, aes_iv)
 
-            st.download_button(label=f"Download {file_name}",
-                            data=decrypted_data,
-                            file_name=file_name,
-                            mime="application/octet-stream",
-                            key=f"download_button_{file_id}")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(label=f"Download {file_name}",
+                                data=decrypted_data,
+                                file_name=file_name,
+                                mime="application/octet-stream",
+                                key=f"download_button_{file_id}")
+            with col2:
+                # Revoke button removed for received files (only sender can revoke)
+                pass
     else:
         st.write("No files received yet.")
 
-# File sharing interface
+# Updated file sharing interface with Sent Files tab
 def file_sharing_interface(username):
     st.subheader("File Sharing Interface")
-    tabs = st.tabs(["Send File", "Received Files"])
+    tabs = st.tabs(["Send File", "Received Files", "Sent Files"])
 
     with tabs[0]:
         st.write("### Send File")
@@ -245,13 +326,17 @@ def file_sharing_interface(username):
         st.write("### Received Files")
         list_received_files(username)
 
+    with tabs[2]:
+        st.write("### Sent Files")
+        list_sent_files(username)
+
+
 # Main function
 def main():
     st.title("Secure File Sharing App")
 
-    # Session state to track login status
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
+    # Initialize session and check for cookies
+    initialize_session()
 
     # Login and registration interface
     if not st.session_state.logged_in:
@@ -273,10 +358,14 @@ def main():
             if st.button("Register", key="register_button"):
                 register_user(new_username, new_password)
 
-    # If logged in, show file sharing interface
+    # If logged in, show file sharing interface and logout option
     if st.session_state.logged_in:
         st.success(f"Welcome, {st.session_state.username}!")
         file_sharing_interface(st.session_state.username)
+
+        if st.button("Logout", key="logout_button"):
+            logout()
+
 
 if __name__ == '__main__':
     main()
